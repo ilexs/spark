@@ -18,8 +18,9 @@ package org.apache.spark.deploy.kubernetes.integrationtest
 
 import java.util.UUID
 
-import org.scalatest.concurrent.Eventually
 import scala.collection.JavaConverters._
+
+import org.scalatest.concurrent.Eventually
 
 import org.apache.spark.SparkConf
 import org.apache.spark.deploy.kubernetes.config._

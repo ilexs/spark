@@ -21,7 +21,7 @@ import java.util.UUID
 import org.scalatest.{BeforeAndAfter, DoNotDiscover}
 import org.scalatest.concurrent.Eventually
 
-import org.apache.spark.{SparkConf, SparkFunSuite, SSLOptions}
+import org.apache.spark.{SSLOptions, SparkConf, SparkFunSuite}
 import org.apache.spark.deploy.kubernetes.SSLUtils
 import org.apache.spark.deploy.kubernetes.config._
 import org.apache.spark.deploy.kubernetes.integrationtest.minikube.Minikube

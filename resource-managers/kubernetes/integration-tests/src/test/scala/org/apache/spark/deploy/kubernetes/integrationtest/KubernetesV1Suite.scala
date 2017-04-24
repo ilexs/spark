@@ -16,16 +16,21 @@
  */
 package org.apache.spark.deploy.kubernetes.integrationtest
 
+import java.io.FileInputStream
+import java.nio.file.Paths
 import java.util.concurrent.TimeUnit
+
+import scala.collection.JavaConverters._
 
 import com.google.common.collect.ImmutableList
 import com.google.common.util.concurrent.SettableFuture
 import io.fabric8.kubernetes.api.model.Pod
+import io.fabric8.kubernetes.api.model.extensions.DaemonSet
 import io.fabric8.kubernetes.client.{KubernetesClientException, Watcher}
 import io.fabric8.kubernetes.client.Watcher.Action
+import io.fabric8.kubernetes.client.internal.readiness.Readiness
 import org.scalatest.{BeforeAndAfter, DoNotDiscover}
 import org.scalatest.concurrent.Eventually
-import scala.collection.JavaConverters._
 
 import org.apache.spark.{SparkConf, SparkException, SparkFunSuite}
 import org.apache.spark.deploy.kubernetes.SSLUtils
@@ -50,6 +55,18 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
 
   override def afterAll(): Unit = {
     kubernetesTestComponents.deleteNamespace()
+  }
+
+  private def getSparkMetricsService(sparkBaseAppName: String): SparkRestApiV1 = {
+    val serviceName = kubernetesTestComponents.kubernetesClient.services()
+      .withLabel("spark-app-name", sparkBaseAppName)
+      .list()
+      .getItems
+      .get(0)
+      .getMetadata
+      .getName
+    Minikube.getService[SparkRestApiV1](serviceName,
+      kubernetesTestComponents.namespace, "spark-ui-port")
   }
 
   before {
@@ -77,18 +94,6 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
     })
   }
 
-  private def getSparkMetricsService(sparkBaseAppName: String): SparkRestApiV1 = {
-    val serviceName = kubernetesTestComponents.kubernetesClient.services()
-      .withLabel("spark-app-name", sparkBaseAppName)
-      .list()
-      .getItems
-      .get(0)
-      .getMetadata
-      .getName
-    Minikube.getService[SparkRestApiV1](serviceName,
-      kubernetesTestComponents.namespace, "spark-ui-port")
-  }
-
   private def expectationsForStaticAllocation(sparkMetricsService: SparkRestApiV1): Unit = {
     val apps = Eventually.eventually(KubernetesSuite.TIMEOUT, KubernetesSuite.INTERVAL) {
       val result = sparkMetricsService
@@ -111,6 +116,55 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
       result
     }
   }
+
+  private def expectationsForDynamicAllocation(sparkMetricsService: SparkRestApiV1): Unit = {
+    val apps = Eventually.eventually(KubernetesSuite.TIMEOUT, KubernetesSuite.INTERVAL) {
+      val result = sparkMetricsService
+        .getApplications(ImmutableList.of(ApplicationStatus.RUNNING, ApplicationStatus.COMPLETED))
+      assert(result.size == 1
+        && !result.head.id.equalsIgnoreCase("appid")
+        && !result.head.id.equalsIgnoreCase("{appId}"))
+      result
+    }
+    Eventually.eventually(KubernetesSuite.TIMEOUT, KubernetesSuite.INTERVAL) {
+      val result = sparkMetricsService.getExecutors(apps.head.id)
+      assert(result.size == 3)
+      result
+    }
+    Eventually.eventually(KubernetesSuite.TIMEOUT, KubernetesSuite.INTERVAL) {
+      val result = sparkMetricsService.getStages(
+        apps.head.id, Seq(StageStatus.COMPLETE).asJava)
+      assert(result.size == 2)
+      result
+    }
+  }
+
+  private def createShuffleServiceDaemonSet(): Unit = {
+    val SHUFFLE_SERVICE_YAML = Paths.get("src", "test", "resources",
+      "kubernetes-shuffle-service.yaml")
+    val resList = kubernetesTestComponents.kubernetesClient.load(
+      new FileInputStream(SHUFFLE_SERVICE_YAML.toFile)).get()
+    assert(!resList.isEmpty())
+    assert(resList.get(0).isInstanceOf[DaemonSet])
+    val ds = kubernetesTestComponents.kubernetesClient.extensions().daemonSets()
+      .create(resList.get(0).asInstanceOf[DaemonSet])
+
+    // wait for daemonset to become available.
+    Eventually.eventually(KubernetesSuite.TIMEOUT, KubernetesSuite.INTERVAL) {
+      val pods = kubernetesTestComponents.kubernetesClient.pods()
+        .withLabel("app", "spark-shuffle-service").list().getItems()
+
+      if (pods.size() == 0) {
+        throw ShuffleNotReadyException()
+      }
+
+      if (Readiness.isPodReady(pods.get(0))) {
+        throw ShuffleNotReadyException()
+      }
+    }
+  }
+
+  case class ShuffleNotReadyException() extends Exception
 
   test("Run a simple example") {
     new Client(
@@ -136,7 +190,7 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
   test("Run with custom labels and annotations") {
     sparkConf.set(KUBERNETES_DRIVER_LABELS, "label1=label1value,label2=label2value")
     sparkConf.set(KUBERNETES_DRIVER_ANNOTATIONS, "annotation1=annotation1value," +
-        "annotation2=annotation2value")
+      "annotation2=annotation2value")
     new Client(
       sparkConf = sparkConf,
       mainClass = KubernetesSuite.SPARK_PI_MAIN_CLASS,
@@ -210,7 +264,7 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
         val allSuccessful = containerStatuses.nonEmpty && containerStatuses
           .forall(status => {
             status.getState.getTerminated != null && status.getState.getTerminated.getExitCode == 0
-        })
+          })
         if (allSuccessful) {
           podCompletedFuture.set(true)
         } else {
@@ -230,9 +284,9 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
       }
     }
     Utils.tryWithResource(kubernetesTestComponents.kubernetesClient
-        .pods
-        .withLabel("spark-app-name", "spark-file-existence-test")
-        .watch(watch)) { _ =>
+      .pods
+      .withLabel("spark-app-name", "spark-file-existence-test")
+      .watch(watch)) { _ =>
       new Client(
         sparkConf = sparkConf,
         mainClass = KubernetesSuite.FILE_EXISTENCE_MAIN_CLASS,
@@ -260,8 +314,8 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
     val externalUriProviderWatch =
       new ExternalUriProviderWatch(kubernetesTestComponents.kubernetesClient)
     Utils.tryWithResource(kubernetesTestComponents.kubernetesClient.services()
-        .withLabel("spark-app-name", "spark-pi")
-        .watch(externalUriProviderWatch)) { _ =>
+      .withLabel("spark-app-name", "spark-pi")
+      .watch(externalUriProviderWatch)) { _ =>
       sparkConf.set(DRIVER_SERVICE_MANAGER_TYPE, ExternalSuppliedUrisDriverServiceManager.TYPE)
       new Client(
         sparkConf = sparkConf,
@@ -278,7 +332,7 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
         .getItems
         .asScala(0)
       assert(driverService.getMetadata.getAnnotations.containsKey(ANNOTATION_PROVIDE_EXTERNAL_URI),
-          "External URI request annotation was not set on the driver service.")
+        "External URI request annotation was not set on the driver service.")
       // Unfortunately we can't check the correctness of the actual value of the URI, as it depends
       // on the driver submission port set on the driver service but we remove that port from the
       // service once the submission is complete.
@@ -303,4 +357,29 @@ private[spark] class KubernetesV1Suite extends SparkFunSuite with BeforeAndAfter
     expectationsForStaticAllocation(sparkMetricsService)
   }
 
+  test("Dynamic executor scaling basic test") {
+    createShuffleServiceDaemonSet()
+
+    sparkConf.set(KUBERNETES_DRIVER_CA_CERT_FILE,
+      kubernetesTestComponents.clientConfig.getCaCertFile)
+    sparkConf.set(KUBERNETES_DRIVER_CLIENT_KEY_FILE,
+      kubernetesTestComponents.clientConfig.getClientKeyFile)
+    sparkConf.set(KUBERNETES_DRIVER_CLIENT_CERT_FILE,
+      kubernetesTestComponents.clientConfig.getClientCertFile)
+    sparkConf.set("spark.dynamicAllocation.enabled", "true")
+    sparkConf.set("spark.shuffle.service.enabled", "true")
+    sparkConf.set("spark.dynamicAllocation.maxExecutors", "3")
+    sparkConf.set("spark.kubernetes.shuffle.namespace",
+      kubernetesTestComponents.namespace)
+    sparkConf.set("spark.kubernetes.shuffle.labels",
+      "app=spark-shuffle-service")
+
+    new Client(
+      sparkConf = sparkConf,
+      mainClass = KubernetesSuite.GROUP_BY_MAIN_CLASS,
+      mainAppResource = KubernetesSuite.SUBMITTER_LOCAL_MAIN_APP_RESOURCE,
+      appArgs = Array.empty[String]).run()
+    val sparkMetricsService = getSparkMetricsService("spark-pi")
+    expectationsForDynamicAllocation(sparkMetricsService)
+  }
 }
